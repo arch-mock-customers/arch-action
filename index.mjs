@@ -170,11 +170,21 @@ export async function collect(github, repository, state, deployment) {
   }
   const inventory = new Map();
   if (replace) {
-    const reachable = new Set((await pages(github, `${repo}/commits?sha=${deployment.revision}`)).map(c => c.sha));
+    const recorded = deployment.mode === 'refresh'
+      ? new Map(state.prs.map(p => [p.number, p.revision])) : null;
+    const reachable = recorded ? null
+      : new Set((await pages(github, `${repo}/commits?sha=${deployment.revision}`)).map(c => c.sha));
     for (const pr of await pages(github, `${repo}/pulls?state=closed`)) {
-      if (pr.merged_at && inRepository(pr, repository) && reachable.has(pr.merge_commit_sha)) {
+      if (pr.merged_at && inRepository(pr, repository)
+          && (recorded ? recorded.has(pr.number) : reachable.has(pr.merge_commit_sha))) {
+        if (recorded && recorded.get(pr.number) !== pr.merge_commit_sha) {
+          throw new Error('Metadata refresh cannot change a recorded PR revision');
+        }
         inventory.set(pr.number, member(pr, false));
       }
+    }
+    if (recorded && inventory.size !== recorded.size) {
+      throw new Error('Metadata refresh could not find every recorded PR');
     }
   }
   const direct = [];

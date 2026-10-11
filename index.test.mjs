@@ -128,17 +128,24 @@ for (const status of ['behind', 'diverged']) test(`${status} rebuilds membership
   assert.equal(result.prs[0].body, null);
 });
 
-test('manual refresh updates coordination only; no invented deployment context', async () => {
+test('manual refresh updates coordination without adding newly associated PRs', async () => {
   const get = async path => {
-    if (path.includes('/commits?')) return [{sha: a}];
-    if (path.includes('/pulls?')) return [pr(1, a, '## Deployment coordination\nEdited block')];
+    if (path.includes('/pulls?')) return [pr(1, a, '## Deployment coordination\nEdited block'), pr(2, a)];
     throw Error(path);
   };
-  const result = await collect(get, state.repository, state, {...deployment, mode: 'refresh'});
+  const current = {...state, prs: [{number: 1, revision: a}]};
+  const result = await collect(get, state.repository, current, {...deployment, mode: 'refresh'});
   assert.equal(result.historical, false);
+  assert.deepEqual(result.prs.map(p => [p.number, p.revision]), [[1, a]]);
   assert.equal(result.prs[0].body, null);
   assert.match(result.prs[0].coordination, /Edited block/);
   assert.deepEqual(result.commits, []);
+});
+
+for (const available of [[], [pr(1, b)]]) test(`refresh rejects ${available.length ? 'changed' : 'missing'} recorded PRs`, async () => {
+  const current = {...state, prs: [{number: 1, revision: a}]};
+  await assert.rejects(collect(async () => available, state.repository, current,
+    {...deployment, mode: 'refresh'}), /Metadata refresh/);
 });
 
 test('partial GitHub failure never submits an empty replacement', async () => {
