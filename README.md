@@ -79,6 +79,10 @@ Node 24 JavaScript Action using only the standard library.
 The Action reads `GET /v1/deployments/current`, computes metadata against the
 accepted SHA, then submits bounded batches to `POST /v1/deployments`. Forward
 history uses commit ancestry and PR associations, never merge timestamps alone.
+It also scans merged PRs for merge commits in the deployed range, so every member
+of a merged stack is included even when GitHub associates only its outer PR.
+A later real deployment recovers omitted PRs at already-recorded merge commits
+as historical coordination metadata, without resending their old QA descriptions.
 Initialization and rollback/divergence rebuild the included-PR inventory; initial
 history sends coordination sections without full old PR descriptions. Failed
 GitHub reads fail the Action and cannot become an empty inventory.
