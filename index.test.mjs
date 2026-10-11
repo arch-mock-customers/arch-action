@@ -30,6 +30,7 @@ test('foreign PR associations never supply descriptions or membership', async ()
   const foreign = {...pr(2, b, 'Foreign private description'), base: {repo: {full_name: 'other/repo'}}};
   const result = await collect(async path => {
     if (path.includes(`/compare/${a}...${b}`)) return {status: 'ahead', commits: [{sha: b, commit: {message: 'Local commit'}}]};
+    if (path.includes('/pulls?state=closed')) return [foreign];
     if (path.includes(`/commits/${b}/pulls`)) return [foreign];
     throw Error(path);
   }, state.repository, state, deployment);
@@ -88,6 +89,7 @@ test('initial head without associated PR selects historical regression', async (
 test('forward comparison proves PR ancestry; commit metadata is allowlisted', async () => {
   const get = async path => {
     if (path.includes(`/compare/${a}...${b}`)) return {status: 'ahead', commits: [{sha: b}, {sha: c, commit: {message: 'Direct fix'}, files: ['private code']}]};
+    if (path.includes('/pulls?state=closed')) return [pr(2, b)];
     if (path.includes(`/commits/${b}/pulls`)) return [pr(2, b)];
     if (path.includes(`/commits/${c}/pulls`)) return [];
     if (path.includes(`/compare/${b}...${b}`)) return {status: 'identical'};
@@ -97,6 +99,34 @@ test('forward comparison proves PR ancestry; commit metadata is allowlisted', as
   assert.equal(result.inventory, 'delta');
   assert.equal(result.prs[0].number, 2);
   assert.deepEqual(result.commits, [{revision: c, message: 'Direct fix'}]);
+});
+
+test('forward deployment includes every stacked PR at a deployed merge commit', async () => {
+  const get = async path => {
+    if (path.includes(`/compare/${a}...${b}`)) return {status: 'ahead', commits: [{sha: b}]};
+    if (path.includes('/pulls?state=closed')) return path.includes('page=2')
+      ? [pr(2, b), pr(3, b)] : Array.from({length: 100}, (_, i) => pr(i + 10, c));
+    if (path.includes(`/commits/${b}/pulls`)) return [pr(2, b)];
+    if (path.includes(`/compare/${b}...${b}`)) return {status: 'identical'};
+    throw Error(path);
+  };
+  const result = await collect(get, state.repository, state, deployment);
+  assert.equal(result.inventory, 'delta');
+  assert.deepEqual(result.prs.map(p => [p.number, p.body]), [[2, 'Test checkout'], [3, 'Test checkout']]);
+  assert.deepEqual(result.commits, []);
+});
+
+test('a real redeployment recovers missing stack members as historical metadata', async () => {
+  const get = async path => {
+    if (path.includes(`/compare/${b}...${b}`)) return {status: 'identical', commits: []};
+    if (path.includes('/pulls?state=closed')) return [pr(1, a), pr(2, a), pr(3, c), pr(4, b)];
+    throw Error(path);
+  };
+  const current = {...state, revision: b, prs: [{number: 1, revision: a}]};
+  const result = await collect(get, state.repository, current, deployment);
+  assert.equal(result.inventory, 'delta');
+  assert.deepEqual(result.prs.map(p => [p.number, p.revision, p.body]), [[2, a, null], [4, b, null]]);
+  assert.deepEqual(result.commits, []);
 });
 
 test('pagination never silently truncates commit ranges or closed PRs', async () => {
@@ -168,6 +198,7 @@ test('tokens remain on fixed origins and outgoing payload is metadata-only', asy
     if (url.host === 'api.github.com') {
       assert.equal(options.headers.Authorization, 'Bearer github-secret');
       assert.equal(options.redirect, 'error');
+      if (url.pathname.endsWith('/pulls')) return reply([]);
       return reply({status: 'identical', commits: []});
     }
     assert.equal(url.origin, 'https://api.foothill.sh');
@@ -186,7 +217,7 @@ test('stale inventory refreshes cursor and recomputes without changing deploymen
   let gets = 0;
   const sent = [];
   const fetcher = async (url, options) => {
-    if (url.host === 'api.github.com') return reply({status: 'identical', commits: []});
+    if (url.host === 'api.github.com') return reply(url.pathname.endsWith('/pulls') ? [] : {status: 'identical', commits: []});
     if (options.method === 'GET') return reply({...state, report_id: ++gets === 1 ? 'old' : 'new'});
     sent.push(JSON.parse(options.body));
     return sent.length === 1 ? reply({code: 'stale_inventory'}, 409) : reply({status: 'accepted'});

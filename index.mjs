@@ -186,6 +186,20 @@ export async function collect(github, repository, state, deployment) {
     if (recorded && inventory.size !== recorded.size) {
       throw new Error('Metadata refresh could not find every recorded PR');
     }
+  } else {
+    const added = new Set(commits.map(commit => commit.sha));
+    const recorded = new Set(state.prs.map(pr => pr.number));
+    const previous = new Set([state.revision, ...state.prs.map(pr => pr.revision)]);
+    // A commit's associated-PR endpoint can omit inner PRs in a merged stack.
+    for (const pr of await pages(github, `${repo}/pulls?state=closed`)) {
+      if (!pr.merged_at || !inRepository(pr, repository)) continue;
+      if (added.has(pr.merge_commit_sha)) {
+        inventory.set(pr.number, member(pr, true));
+      } else if (!recorded.has(pr.number) && previous.has(pr.merge_commit_sha)) {
+        // Recover old omissions without treating their descriptions as new changes.
+        inventory.set(pr.number, member(pr, false));
+      }
+    }
   }
   const direct = [];
   if (!state.revision && deployment.mode !== 'refresh') {
