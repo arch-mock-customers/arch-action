@@ -12,6 +12,10 @@ const pr = (number, sha, body = 'Test checkout') => ({number, merge_commit_sha: 
   base: {repo: {full_name: 'acme/web'}},
   diff_url: 'do-not-send', head: {repo: {source: 'do-not-send'}}, user: {email: 'do-not-send'}});
 const reply = (data, status = 200) => new Response(JSON.stringify(data), {status});
+const comparison = (commits, base = a, trees = {}) => ({status: 'ahead',
+  base_commit: {sha: base, commit: {tree: {sha: trees[base] || base}}},
+  commits: commits.map(commit => ({...commit, commit: {...commit.commit, tree: {sha: trees[commit.sha] || commit.sha}}})),
+});
 
 test('direct input uses actual deployed SHA, not workflow SHA', () => {
   assert.deepEqual(deploymentInput(inputs, {}, {...env, GITHUB_SHA: a}, state), deployment);
@@ -29,7 +33,7 @@ test('timezone-free completion fails before GitHub reads or reporting', async ()
 test('foreign PR associations never supply descriptions or membership', async () => {
   const foreign = {...pr(2, b, 'Foreign private description'), base: {repo: {full_name: 'other/repo'}}};
   const result = await collect(async path => {
-    if (path.includes(`/compare/${a}...${b}`)) return {status: 'ahead', commits: [{sha: b, commit: {message: 'Local commit'}}]};
+    if (path.includes(`/compare/${a}...${b}`)) return comparison([{sha: b, commit: {message: 'Local commit'}}]);
     if (path.includes('/pulls?state=closed')) return [foreign];
     if (path.includes(`/commits/${b}/pulls`)) return [foreign];
     throw Error(path);
@@ -83,12 +87,13 @@ test('initial head without associated PR selects historical regression', async (
   };
   const result = await collect(get, state.repository, {...state, revision: null}, deployment);
   assert.equal(result.historical, true);
+  assert.equal(result.no_code_change, false);
   assert.deepEqual(result.commits, []);
 });
 
 test('forward comparison reports numbered PRs and omits unmatched commits', async () => {
   const get = async path => {
-    if (path.includes(`/compare/${a}...${b}`)) return {status: 'ahead', commits: [{sha: b}, {sha: c, commit: {message: "Merge commit 'old-branch' into HEAD"}, files: ['private code']}]};
+    if (path.includes(`/compare/${a}...${b}`)) return comparison([{sha: b}, {sha: c, commit: {message: "Merge commit 'old-branch' into HEAD"}, files: ['private code']}]);
     if (path.includes('/pulls?state=closed')) return [pr(2, b)];
     if (path.includes(`/commits/${b}/pulls`)) return [pr(2, b)];
     if (path.includes(`/commits/${c}/pulls`)) return [];
@@ -97,6 +102,7 @@ test('forward comparison reports numbered PRs and omits unmatched commits', asyn
   };
   const result = await collect(get, state.repository, state, deployment);
   assert.equal(result.inventory, 'delta');
+  assert.equal(result.no_code_change, false);
   assert.equal(result.prs[0].number, 2);
   assert.deepEqual(result.commits, []);
   assert.doesNotMatch(JSON.stringify(result), /Merge commit|private code/);
@@ -104,7 +110,7 @@ test('forward comparison reports numbered PRs and omits unmatched commits', asyn
 
 test('forward deployment includes every stacked PR at a deployed merge commit', async () => {
   const get = async path => {
-    if (path.includes(`/compare/${a}...${b}`)) return {status: 'ahead', commits: [{sha: b}]};
+    if (path.includes(`/compare/${a}...${b}`)) return comparison([{sha: b}]);
     if (path.includes('/pulls?state=closed')) return path.includes('page=2')
       ? [pr(2, b), pr(3, b)] : Array.from({length: 100}, (_, i) => pr(i + 10, c));
     if (path.includes(`/commits/${b}/pulls`)) return [pr(2, b)];
@@ -113,6 +119,7 @@ test('forward deployment includes every stacked PR at a deployed merge commit', 
   };
   const result = await collect(get, state.repository, state, deployment);
   assert.equal(result.inventory, 'delta');
+  assert.equal(result.no_code_change, false);
   assert.deepEqual(result.prs.map(p => [p.number, p.body]), [[2, 'Test checkout'], [3, 'Test checkout']]);
   assert.deepEqual(result.commits, []);
 });
@@ -126,6 +133,7 @@ test('a real redeployment recovers missing stack members as historical metadata'
   const current = {...state, revision: b, prs: [{number: 1, revision: a}]};
   const result = await collect(get, state.repository, current, deployment);
   assert.equal(result.inventory, 'delta');
+  assert.equal(result.no_code_change, false);
   assert.deepEqual(result.prs.map(p => [p.number, p.revision, p.body]), [[2, a, null], [4, b, null]]);
   assert.deepEqual(result.commits, []);
 });
@@ -135,8 +143,8 @@ test('pagination never silently truncates commit ranges or closed PRs', async ()
   const commits = Array.from({length: 100}, (_, i) => ({sha: i.toString(16).padStart(40, '0'), commit: {message: 'fix'}}));
   const get = async path => {
     calls.push(path);
-    if (path.includes('/compare/')) return {status: 'ahead', commits: path.includes('page=2') ? [{sha: c, commit: {message: 'last'}}] : [...commits]};
-    if (path.includes('/pulls?state=closed')) return [pr(2, c)];
+    if (path.includes('/compare/')) return comparison(path.includes('page=2') ? [{sha: b, commit: {message: 'last'}}] : [...commits]);
+    if (path.includes('/pulls?state=closed')) return [pr(2, b)];
     if (path.includes('/pulls')) return [];
     throw Error(path);
   };
@@ -156,6 +164,7 @@ for (const status of ['behind', 'diverged']) test(`${status} rebuilds membership
   const result = await collect(get, state.repository, state, deployment);
   assert.equal(result.inventory, 'replace');
   assert.equal(result.historical, true);
+  assert.equal(result.no_code_change, false);
   assert.deepEqual(result.prs.map(p => p.number), [1]);
   assert.equal(result.prs[0].body, null);
 });
@@ -401,4 +410,73 @@ test('failed, staging and production deployment events never report previews', a
   ]) {
     assert.equal(await run(previewInputs, event, env, async url => {throw Error(url.href);}), null);
   }
+});
+
+for (const environment of ['staging', 'UAT', 'Production']) test(`identical trees report only metadata in ${environment}`, async () => {
+  const body = 'Release\n## Deployment coordination\n- Related PRs:\n  - https://github.com/acme/api/pull/2';
+  const get = async path => {
+    if (path.includes(`/compare/${a}...${b}`)) return comparison([{sha: b}], a, {[b]: a});
+    if (path.includes(`/compare/${b}...${b}`)) return {status: 'identical'};
+    if (path.includes('/pulls')) return [pr(2, b, body)];
+    throw Error(path);
+  };
+  const result = await collect(get, state.repository, {...state, environment}, deployment);
+  assert.equal(result.no_code_change, true);
+  assert.equal(result.historical, false);
+  assert.equal(result.inventory, 'delta');
+  assert.deepEqual(result.prs, [{number: 2, revision: b, title: '', body: null, coordination: coordination(body)}]);
+});
+
+for (const broken of [null, {}, {sha: c, commit: {tree: {sha: c}}}]) test(`invalid commit trees never suppress QA: ${JSON.stringify(broken)}`, async () => {
+  let posted = false;
+  await assert.rejects(run(inputs, {}, env, async (url, options) => {
+    if (url.host === 'api.foothill.sh') {
+      if (options.method === 'POST') posted = true;
+      return reply(state);
+    }
+    if (url.pathname.includes('/compare/')) {
+      return broken === null ? reply({}, 403) : reply({...comparison([{sha: b}]), base_commit: broken});
+    }
+    throw Error(url.href);
+  }), /HTTP 403|Incomplete commit tree response/);
+  assert.equal(posted, false);
+});
+
+test('unchanged-code decision is recomputed after a concurrent deployment changes the base', async () => {
+  let reads = 0;
+  const sent = [];
+  const get = async (url, options) => {
+    if (url.host === 'api.foothill.sh') {
+      if (options.method === 'GET') return reply({...state, report_id: ++reads === 1 ? 'old' : 'new', revision: reads === 1 ? a : c});
+      sent.push(JSON.parse(options.body));
+      return sent.length === 1 ? reply({code: 'stale_inventory'}, 409) : reply({status: 'accepted'});
+    }
+    if (url.pathname.includes('/compare/')) return reply(comparison([{sha: b}], reads === 1 ? a : c, {[b]: a}));
+    if (url.pathname.endsWith('/pulls')) return reply([pr(2, b)]);
+    throw Error(url.href);
+  };
+  await run(inputs, {}, env, get);
+  assert.equal(sent[0].header.no_code_change, true);
+  assert.equal(sent[0].prs[0].body, null);
+  assert.equal(sent[1].header.no_code_change, undefined);
+  assert.equal(sent[1].prs[0].body, 'Test checkout');
+  assert.equal(sent[0].header.deployment_id, sent[1].header.deployment_id);
+});
+
+test('redelivery reproduces the original unchanged-code report instead of treating it as a redeployment', async () => {
+  const sent = [];
+  await run(inputs, {}, env, async (url, options) => {
+    if (url.host === 'api.foothill.sh') {
+      if (options.method === 'GET') return reply(url.searchParams.has('report_id') ? state : {
+        ...state, report_id: 'accepted', revision: b, deployment_id: deployment.deployment_id, expected_report_id: state.report_id,
+      });
+      sent.push(JSON.parse(options.body));
+      return reply({status: 'accepted'});
+    }
+    if (url.pathname.includes('/compare/')) return reply(comparison([{sha: b}], a, {[b]: a}));
+    if (url.pathname.endsWith('/pulls')) return reply([pr(2, b)]);
+    throw Error(url.href);
+  });
+  assert.equal(sent[0].header.no_code_change, true);
+  assert.equal(sent[0].header.expected_report_id, state.report_id);
 });
