@@ -134,6 +134,17 @@ accepted SHA, then submits bounded batches to `POST /v1/deployments`. Forward
 history uses commit ancestry and PR associations, never merge timestamps alone.
 It also scans merged PRs for merge commits in the deployed range, so every member
 of a merged stack is included even when GitHub associates only its outer PR.
+For forward deployments with a new commit, the Action compares the previous and
+incoming Git commit trees. Identical tracked files produce a `no_code_change`
+report: deployment/PR metadata advances without adding QA context or canceling
+existing QA. This is local to the configured target, regardless of branch names.
+First deployments, rollback/divergence, same-commit redeployments, refresh, and
+explicit preview reruns keep their existing behavior. Tree reads must succeed;
+configuration or external-service changes are not represented by a Git tree.
+
+Deploy the Arch backend's `no_code_change` support before publishing this Action
+version to `latest`; older backends reject the new field.
+
 Only numbered PRs supply QA change context. Unmatched commits, including branch
 merge commits and direct pushes, still advance the recorded deployment but are
 not reported as separate changes to test.

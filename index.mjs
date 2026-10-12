@@ -211,6 +211,7 @@ export async function collect(github, repository, state, deployment) {
   const repo = `/repos/${repository}`;
   let replace = !state.revision || deployment.mode === 'refresh';
   let historical = false;
+  let noCodeChange = false;
   let commits = [];
   if (!replace) {
     let comparison;
@@ -234,6 +235,17 @@ export async function collect(github, repository, state, deployment) {
             commits.push(...next.commits);
             if (next.commits.length < 100) break;
           }
+        }
+        if (comparison.status === 'ahead' && state.revision !== deployment.revision) {
+          // Reuse the full comparison, including a head commit on a later page.
+          const base = comparison.base_commit;
+          const head = commits.find(commit => commit.sha === deployment.revision);
+          const baseTree = base?.commit?.tree?.sha;
+          const headTree = head?.commit?.tree?.sha;
+          if (base?.sha !== state.revision || !shaPattern.test(baseTree || '') || !shaPattern.test(headTree || '')) {
+            throw new Error('Incomplete commit tree response');
+          }
+          noCodeChange = baseTree === headTree;
         }
       } else throw new Error('Unrecognized comparison status');
     }
@@ -264,7 +276,7 @@ export async function collect(github, repository, state, deployment) {
     for (const pr of await pages(github, `${repo}/pulls?state=closed`)) {
       if (!pr.merged_at || !inRepository(pr, repository)) continue;
       if (added.has(pr.merge_commit_sha)) {
-        inventory.set(pr.number, member(pr, true));
+        inventory.set(pr.number, member(pr, !noCodeChange));
       } else if (!recorded.has(pr.number) && previous.has(pr.merge_commit_sha)) {
         // Recover old omissions without treating their descriptions as new changes.
         inventory.set(pr.number, member(pr, false));
@@ -285,7 +297,7 @@ export async function collect(github, repository, state, deployment) {
           included = ['ahead', 'identical'].includes(result.status);
         }
         if (included) {
-          inventory.set(pr.number, member(pr, true));
+          inventory.set(pr.number, member(pr, !noCodeChange));
         }
       }
     }
@@ -294,7 +306,7 @@ export async function collect(github, repository, state, deployment) {
     historical = true;
   }
   return {
-    inventory: replace ? 'replace' : 'delta', historical,
+    inventory: replace ? 'replace' : 'delta', historical, no_code_change: noCodeChange,
     prs: [...inventory.values()].sort((a, b) => a.number - b.number),
     removed: [], commits: [],
   };
@@ -344,7 +356,8 @@ export async function run(inputs, event, env, fetcher = fetch) {
   const data = await collect(github, state.repository, state, deployment);
   const parts = batches(data);
   const header = {...deployment, expected_report_id: state.report_id,
-    inventory: data.inventory, historical: data.historical, batch_count: parts.length};
+    inventory: data.inventory, historical: data.historical, batch_count: parts.length,
+    ...(data.no_code_change ? {no_code_change: true} : {})};
   let receipt;
   try {
   for (let batch = 0; batch < parts.length; batch++) {
