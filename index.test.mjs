@@ -30,12 +30,13 @@ test('foreign PR associations never supply descriptions or membership', async ()
   const foreign = {...pr(2, b, 'Foreign private description'), base: {repo: {full_name: 'other/repo'}}};
   const result = await collect(async path => {
     if (path.includes(`/compare/${a}...${b}`)) return {status: 'ahead', commits: [{sha: b, commit: {message: 'Local commit'}}]};
+    if (path.includes('/pulls?state=closed')) return [foreign];
     if (path.includes(`/commits/${b}/pulls`)) return [foreign];
     throw Error(path);
   }, state.repository, state, deployment);
   assert.deepEqual(result.prs, []);
   assert.doesNotMatch(JSON.stringify(result), /Foreign private description|other\/repo/);
-  assert.deepEqual(result.commits, [{revision: b, message: 'Local commit'}]);
+  assert.deepEqual(result.commits, []);
 });
 
 test('provider event filters success/environment and uses event identity/order', () => {
@@ -85,9 +86,10 @@ test('initial head without associated PR selects historical regression', async (
   assert.deepEqual(result.commits, []);
 });
 
-test('forward comparison proves PR ancestry; commit metadata is allowlisted', async () => {
+test('forward comparison reports numbered PRs and omits unmatched commits', async () => {
   const get = async path => {
-    if (path.includes(`/compare/${a}...${b}`)) return {status: 'ahead', commits: [{sha: b}, {sha: c, commit: {message: 'Direct fix'}, files: ['private code']}]};
+    if (path.includes(`/compare/${a}...${b}`)) return {status: 'ahead', commits: [{sha: b}, {sha: c, commit: {message: "Merge commit 'old-branch' into HEAD"}, files: ['private code']}]};
+    if (path.includes('/pulls?state=closed')) return [pr(2, b)];
     if (path.includes(`/commits/${b}/pulls`)) return [pr(2, b)];
     if (path.includes(`/commits/${c}/pulls`)) return [];
     if (path.includes(`/compare/${b}...${b}`)) return {status: 'identical'};
@@ -96,7 +98,36 @@ test('forward comparison proves PR ancestry; commit metadata is allowlisted', as
   const result = await collect(get, state.repository, state, deployment);
   assert.equal(result.inventory, 'delta');
   assert.equal(result.prs[0].number, 2);
-  assert.deepEqual(result.commits, [{revision: c, message: 'Direct fix'}]);
+  assert.deepEqual(result.commits, []);
+  assert.doesNotMatch(JSON.stringify(result), /Merge commit|private code/);
+});
+
+test('forward deployment includes every stacked PR at a deployed merge commit', async () => {
+  const get = async path => {
+    if (path.includes(`/compare/${a}...${b}`)) return {status: 'ahead', commits: [{sha: b}]};
+    if (path.includes('/pulls?state=closed')) return path.includes('page=2')
+      ? [pr(2, b), pr(3, b)] : Array.from({length: 100}, (_, i) => pr(i + 10, c));
+    if (path.includes(`/commits/${b}/pulls`)) return [pr(2, b)];
+    if (path.includes(`/compare/${b}...${b}`)) return {status: 'identical'};
+    throw Error(path);
+  };
+  const result = await collect(get, state.repository, state, deployment);
+  assert.equal(result.inventory, 'delta');
+  assert.deepEqual(result.prs.map(p => [p.number, p.body]), [[2, 'Test checkout'], [3, 'Test checkout']]);
+  assert.deepEqual(result.commits, []);
+});
+
+test('a real redeployment recovers missing stack members as historical metadata', async () => {
+  const get = async path => {
+    if (path.includes(`/compare/${b}...${b}`)) return {status: 'identical', commits: []};
+    if (path.includes('/pulls?state=closed')) return [pr(1, a), pr(2, a), pr(3, c), pr(4, b)];
+    throw Error(path);
+  };
+  const current = {...state, revision: b, prs: [{number: 1, revision: a}]};
+  const result = await collect(get, state.repository, current, deployment);
+  assert.equal(result.inventory, 'delta');
+  assert.deepEqual(result.prs.map(p => [p.number, p.revision, p.body]), [[2, a, null], [4, b, null]]);
+  assert.deepEqual(result.commits, []);
 });
 
 test('pagination never silently truncates commit ranges or closed PRs', async () => {
@@ -105,13 +136,14 @@ test('pagination never silently truncates commit ranges or closed PRs', async ()
   const get = async path => {
     calls.push(path);
     if (path.includes('/compare/')) return {status: 'ahead', commits: path.includes('page=2') ? [{sha: c, commit: {message: 'last'}}] : [...commits]};
+    if (path.includes('/pulls?state=closed')) return [pr(2, c)];
     if (path.includes('/pulls')) return [];
     throw Error(path);
   };
   const result = await collect(get, state.repository, state, deployment);
-  assert.equal(result.commits.length, 101);
+  assert.deepEqual(result.prs.map(p => p.number), [2]);
+  assert.deepEqual(result.commits, []);
   assert(calls.some(p => p.includes('page=2')));
-  assert.equal(batches(result).length, 2);
 });
 
 for (const status of ['behind', 'diverged']) test(`${status} rebuilds membership and selects regression`, async () => {
@@ -128,17 +160,24 @@ for (const status of ['behind', 'diverged']) test(`${status} rebuilds membership
   assert.equal(result.prs[0].body, null);
 });
 
-test('manual refresh updates coordination only; no invented deployment context', async () => {
+test('manual refresh updates coordination without adding newly associated PRs', async () => {
   const get = async path => {
-    if (path.includes('/commits?')) return [{sha: a}];
-    if (path.includes('/pulls?')) return [pr(1, a, '## Deployment coordination\nEdited block')];
+    if (path.includes('/pulls?')) return [pr(1, a, '## Deployment coordination\nEdited block'), pr(2, a)];
     throw Error(path);
   };
-  const result = await collect(get, state.repository, state, {...deployment, mode: 'refresh'});
+  const current = {...state, prs: [{number: 1, revision: a}]};
+  const result = await collect(get, state.repository, current, {...deployment, mode: 'refresh'});
   assert.equal(result.historical, false);
+  assert.deepEqual(result.prs.map(p => [p.number, p.revision]), [[1, a]]);
   assert.equal(result.prs[0].body, null);
   assert.match(result.prs[0].coordination, /Edited block/);
   assert.deepEqual(result.commits, []);
+});
+
+for (const available of [[], [pr(1, b)]]) test(`refresh rejects ${available.length ? 'changed' : 'missing'} recorded PRs`, async () => {
+  const current = {...state, prs: [{number: 1, revision: a}]};
+  await assert.rejects(collect(async () => available, state.repository, current,
+    {...deployment, mode: 'refresh'}), /Metadata refresh/);
 });
 
 test('partial GitHub failure never submits an empty replacement', async () => {
@@ -161,6 +200,7 @@ test('tokens remain on fixed origins and outgoing payload is metadata-only', asy
     if (url.host === 'api.github.com') {
       assert.equal(options.headers.Authorization, 'Bearer github-secret');
       assert.equal(options.redirect, 'error');
+      if (url.pathname.endsWith('/pulls')) return reply([]);
       return reply({status: 'identical', commits: []});
     }
     assert.equal(url.origin, 'https://api.foothill.sh');
@@ -179,7 +219,7 @@ test('stale inventory refreshes cursor and recomputes without changing deploymen
   let gets = 0;
   const sent = [];
   const fetcher = async (url, options) => {
-    if (url.host === 'api.github.com') return reply({status: 'identical', commits: []});
+    if (url.host === 'api.github.com') return reply(url.pathname.endsWith('/pulls') ? [] : {status: 'identical', commits: []});
     if (options.method === 'GET') return reply({...state, report_id: ++gets === 1 ? 'old' : 'new'});
     sent.push(JSON.parse(options.body));
     return sent.length === 1 ? reply({code: 'stale_inventory'}, 409) : reply({status: 'accepted'});
@@ -243,6 +283,32 @@ test('closed event PR sends no preview report', async () => {
     async url => { throw Error(url.href); }), null);
 });
 
+test('preview ambiguity is checked after rereading eligibility for every matching PR', async () => {
+  const first = {...pr(7, null), state: 'open', head: {sha: c}, labels: [{name: 'arch-qa'}]};
+  const second = {...first, number: 8};
+  const previewInputs = {...inputs, mode: 'preview', 'deployed-sha': c, 'preview-url': 'https://p.example'};
+  let currentSecond = {...second, labels: []};
+  const reports = [];
+  const fetcher = async (url, options) => {
+    if (url.pathname === `/repos/acme/web/commits/${c}/pulls`) return reply([first, second]);
+    if (url.pathname === '/repos/acme/web/pulls/7') return reply(first);
+    if (url.pathname === '/repos/acme/web/pulls/8') return reply(currentSecond);
+    if (url.pathname === '/v1/deployments/preview') {
+      reports.push(JSON.parse(options.body));
+      return reply({status: 'accepted'});
+    }
+    throw Error(url.href);
+  };
+  for (const other of [{...second, labels: []}, {...second, state: 'closed'}, {...second, head: {sha: b}}]) {
+    currentSecond = other;
+    assert.equal((await run(previewInputs, {}, env, fetcher)).status, 'accepted');
+  }
+  assert.deepEqual(reports.map(report => report.pr.number), [7, 7, 7]);
+  currentSecond = second;
+  await assert.rejects(run(previewInputs, {}, env, fetcher), /More than one arch-qa PR/);
+  assert.equal(reports.length, 3);
+});
+
 test('labeling a ready preview and deployment success report the same deployment identity', async () => {
   const current = {...pr(7, null), state: 'open', head: {sha: c}, labels: [{name: 'arch-qa'}]};
   const deployment = {id: 12, sha: c, environment: 'Preview', production_environment: false};
@@ -270,10 +336,18 @@ test('labeling a ready preview and deployment success report the same deployment
   await run(previewInputs, {deployment, deployment_status: status}, env, fetcher);
   // The queued label event is only a reference; current GitHub state controls opt-in.
   await run(previewInputs, {pull_request: {...current, labels: []}},
-    {...env, GITHUB_RUN_ID: '101', GITHUB_RUN_ATTEMPT: '2'}, fetcher);
+    {...env, GITHUB_RUN_ID: '101'}, fetcher);
   assert.equal(reports.length, 2);
   assert.deepEqual(reports[0], reports[1]);
   assert.equal(reports[0].deployment_id, 'github:12');
+  // A deliberate job rerun requests fresh QA, while retries of that attempt still dedupe.
+  const rerun = {...env, GITHUB_RUN_ATTEMPT: '2'};
+  await run(previewInputs, {deployment, deployment_status: status}, rerun, fetcher);
+  await run(previewInputs, {deployment, deployment_status: status}, rerun, fetcher);
+  assert.equal(reports[2].deployment_id, 'github:12:retry:100:2');
+  assert.deepEqual(reports[2], reports[3]);
+  const direct = {...previewInputs, 'preview-url': status.environment_url, 'deployment-id': 'deploy-12'};
+  assert.equal(previewInput(direct, {pull_request: current}, rerun).deployment_id, 'deploy-12:retry:100:2');
 });
 
 test('label before readiness waits; ready previews of new pushes get new identities', async () => {
