@@ -63,30 +63,37 @@ export function previewInput(inputs, event, env) {
     throw new Error('Pass deployed-sha and preview-url for the ready preview');
   }
   if (!shaPattern.test(revision)) throw new Error('Invalid preview commit');
+  let deploymentId = event.deployment?.id ? `github:${event.deployment.id}` : inputs['deployment-id'];
+  // Re-running a job explicitly requests new QA; duplicate events and HTTP retries do not.
+  if (deploymentId && Number(env.GITHUB_RUN_ATTEMPT) > 1) {
+    deploymentId += `:retry:${env.GITHUB_RUN_ID}:${env.GITHUB_RUN_ATTEMPT}`;
+  }
   return {
     revision, url,
-    deployment_id: event.deployment?.id ? `github:${event.deployment.id}`
-      : inputs['deployment-id'] || `${env.GITHUB_RUN_ID}:${env.GITHUB_RUN_ATTEMPT}`,
+    deployment_id: deploymentId || `${env.GITHUB_RUN_ID}:${env.GITHUB_RUN_ATTEMPT}`,
   };
 }
 
 // A pull_request event names its PR even when the preview serves the merge ref.
 export async function previewPR(github, repository, revision, event) {
-  let candidate;
+  let candidates;
   if (event.pull_request && inRepository(event.pull_request, repository)) {
-    candidate = event.pull_request;
+    candidates = [event.pull_request];
   } else {
     if (!shaPattern.test(revision)) throw new Error('Invalid preview commit');
-    const open = (await pages(github, `/repos/${repository}/commits/${revision}/pulls`))
+    candidates = (await pages(github, `/repos/${repository}/commits/${revision}/pulls`))
       .filter(pr => pr.state === 'open' && pr.head?.sha === revision && inRepository(pr, repository));
-    if (open.length > 1) throw new Error('More than one open PR serves this preview commit');
-    candidate = open[0];
   }
-  if (!candidate || candidate.state !== 'open') return null;
-  const pr = await github(`/repos/${repository}/pulls/${candidate.number}`);
   const expectedHead = event.pull_request?.head?.sha || revision;
-  return pr.state === 'open' && inRepository(pr, repository) && pr.head?.sha === expectedHead
-    && pr.labels?.some(label => label.name === 'arch-qa') ? pr : null;
+  const eligible = [];
+  for (const candidate of candidates) {
+    if (candidate.state !== 'open') continue;
+    const pr = await github(`/repos/${repository}/pulls/${candidate.number}`);
+    if (pr.state === 'open' && inRepository(pr, repository) && pr.head?.sha === expectedHead
+        && pr.labels?.some(label => label.name === 'arch-qa')) eligible.push(pr);
+  }
+  if (eligible.length > 1) throw new Error('More than one arch-qa PR serves this preview commit');
+  return eligible[0] || null;
 }
 
 async function reportPreview(arch, github, inputs, event, env) {
@@ -233,14 +240,37 @@ export async function collect(github, repository, state, deployment) {
   }
   const inventory = new Map();
   if (replace) {
-    const reachable = new Set((await pages(github, `${repo}/commits?sha=${deployment.revision}`)).map(c => c.sha));
+    const recorded = deployment.mode === 'refresh'
+      ? new Map(state.prs.map(p => [p.number, p.revision])) : null;
+    const reachable = recorded ? null
+      : new Set((await pages(github, `${repo}/commits?sha=${deployment.revision}`)).map(c => c.sha));
     for (const pr of await pages(github, `${repo}/pulls?state=closed`)) {
-      if (pr.merged_at && inRepository(pr, repository) && reachable.has(pr.merge_commit_sha)) {
+      if (pr.merged_at && inRepository(pr, repository)
+          && (recorded ? recorded.has(pr.number) : reachable.has(pr.merge_commit_sha))) {
+        if (recorded && recorded.get(pr.number) !== pr.merge_commit_sha) {
+          throw new Error('Metadata refresh cannot change a recorded PR revision');
+        }
+        inventory.set(pr.number, member(pr, false));
+      }
+    }
+    if (recorded && inventory.size !== recorded.size) {
+      throw new Error('Metadata refresh could not find every recorded PR');
+    }
+  } else {
+    const added = new Set(commits.map(commit => commit.sha));
+    const recorded = new Set(state.prs.map(pr => pr.number));
+    const previous = new Set([state.revision, ...state.prs.map(pr => pr.revision)]);
+    // A commit's associated-PR endpoint can omit inner PRs in a merged stack.
+    for (const pr of await pages(github, `${repo}/pulls?state=closed`)) {
+      if (!pr.merged_at || !inRepository(pr, repository)) continue;
+      if (added.has(pr.merge_commit_sha)) {
+        inventory.set(pr.number, member(pr, true));
+      } else if (!recorded.has(pr.number) && previous.has(pr.merge_commit_sha)) {
+        // Recover old omissions without treating their descriptions as new changes.
         inventory.set(pr.number, member(pr, false));
       }
     }
   }
-  const direct = [];
   if (!state.revision && deployment.mode !== 'refresh') {
     commits = [{sha: deployment.revision}];
   }
@@ -248,7 +278,6 @@ export async function collect(github, repository, state, deployment) {
     for (const commit of commits) {
       const associated = (await pages(github, `${repo}/commits/${commit.sha}/pulls`))
         .filter(pr => pr.merged_at && inRepository(pr, repository));
-      let matched = false;
       for (const pr of associated) {
         let included = inventory.has(pr.number);
         if (!replace) {
@@ -257,23 +286,17 @@ export async function collect(github, repository, state, deployment) {
         }
         if (included) {
           inventory.set(pr.number, member(pr, true));
-          matched = true;
         }
-      }
-      if (!matched) {
-        const detail = commit.commit ? commit : await github(`${repo}/commits/${commit.sha}`);
-        direct.push({revision: commit.sha, message: (detail.commit?.message || '').slice(0, 20000)});
       }
     }
   }
   if (!state.revision && ![...inventory.values()].some(pr => pr.body !== null)) {
     historical = true;
-    direct.length = 0;
   }
   return {
     inventory: replace ? 'replace' : 'delta', historical,
     prs: [...inventory.values()].sort((a, b) => a.number - b.number),
-    removed: [], commits: direct,
+    removed: [], commits: [],
   };
 }
 

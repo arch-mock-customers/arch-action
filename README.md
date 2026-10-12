@@ -75,7 +75,9 @@ until the provider publishes deployment success. New pushes run QA when their
 previews become ready while the label remains. The Action rereads the PR's current
 label, state and head before reporting: unlabeled or closed PRs and old commits
 are skipped. The two events share `github:<deployment ID>`, so labeling an already
-reported preview or rerunning its workflow returns the same Arch run.
+reported preview returns the same Arch run, even after QA finishes. HTTP retries
+reuse that run too. To request fresh QA, use GitHub Actions **Re-run jobs**:
+subsequent workflow attempts get a new QA identity for the same deployment.
 
 Your provider must publish GitHub deployment statuses with an `environment_url`.
 The environment defaults to `Preview`, matching Vercel; set `preview-environment`
@@ -85,7 +87,8 @@ Action; it never checks out or executes PR code.
 
 For an existing deployment job, call `mode: preview` after readiness with explicit
 `deployed-sha`, `preview-url` and a stable `deployment-id`. The label is still
-required. Automatic late-label lookup requires GitHub deployment records.
+required. Re-running the job requests fresh QA here too, including with an explicit
+`deployment-id`. Automatic late-label lookup requires GitHub deployment records.
 A preview never changes what Arch records as deployed for the target.
 
 Deploy and refresh use `contents: read` and `pull-requests: read`; automatic previews
@@ -114,7 +117,7 @@ even for the same commit. Do not change completion time on an HTTP retry.
 
 - Deployment identity, deployed commit, completion order and accepted-report cursor.
 - Included PR numbers and merged revisions, original deployment-coordination sections.
-- Titles and descriptions for newly shipped changes; bounded direct-commit messages.
+- Titles and descriptions for newly shipped PRs.
 - In preview mode: the open PR's number, title, description, head branch name and author (GitHub login and user ID), the preview commit and its URL.
 
 GitHub credentials, files, diffs and raw API responses are not sent. This Action
@@ -129,6 +132,13 @@ Node 24 JavaScript Action using only the standard library.
 The Action reads `GET /v1/deployments/current`, computes metadata against the
 accepted SHA, then submits bounded batches to `POST /v1/deployments`. Forward
 history uses commit ancestry and PR associations, never merge timestamps alone.
+It also scans merged PRs for merge commits in the deployed range, so every member
+of a merged stack is included even when GitHub associates only its outer PR.
+Only numbered PRs supply QA change context. Unmatched commits, including branch
+merge commits and direct pushes, still advance the recorded deployment but are
+not reported as separate changes to test.
+A later real deployment recovers omitted PRs at already-recorded merge commits
+as historical coordination metadata, without resending their old QA descriptions.
 Initialization and rollback/divergence rebuild the included-PR inventory; initial
 history sends coordination sections without full old PR descriptions. Failed
 GitHub reads fail the Action and cannot become an empty inventory.
