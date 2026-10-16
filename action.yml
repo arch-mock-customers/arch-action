@@ -23,6 +23,8 @@ inputs:
   preview-environment:
     description: GitHub deployment environment used for automatic PR previews.
     default: Preview
+  api-url:
+    description: Arch API origin. Defaults to https://api.foothill.sh; the mock customers set it to a pre-merge Arch API.
 outputs:
   report-id:
     description: Accepted deployment report identifier (deploy and refresh modes).

@@ -218,10 +218,21 @@ test('tokens remain on fixed origins and outgoing payload is metadata-only', asy
     sent.push(JSON.parse(options.body));
     return reply({status: 'accepted', report_id: 'accepted'});
   };
-  await run({...inputs, 'api-url': 'https://evil.example'}, {}, env, fetcher);
+  await run(inputs, {}, env, fetcher);
   assert.equal(sent[0].header.revision, b);
   assert.doesNotMatch(JSON.stringify(sent), /github-secret|arch-secret|source|diff/);
   await assert.rejects(createClient('https://api.github.com', 'token')('https://evil.example/'), /Cross-origin/);
+});
+
+test('mock-customer fork: api-url input replaces the default origin', async () => {
+  const origins = [];
+  const fetcher = async (url, options) => {
+    if (url.host === 'api.github.com') return reply(url.pathname.endsWith('/pulls') ? [] : {status: 'identical', commits: []});
+    origins.push(url.origin);
+    return options.method === 'GET' ? reply(state) : reply({status: 'accepted', report_id: 'r'});
+  };
+  await run({...inputs, 'api-url': 'https://pre-merge.example'}, {}, env, fetcher);
+  assert.ok(origins.length > 0 && origins.every(origin => origin === 'https://pre-merge.example'));
 });
 
 test('stale inventory refreshes cursor and recomputes without changing deployment identity', async () => {

@@ -1,3 +1,5 @@
+> Fork for Arch's mock customers: the `api-url` input points reports at a pre-merge Arch API. Real customers use `the-simulation-company/arch-action@latest`.
+
 # Arch Action
 
 Report successful deployments to Arch without giving Arch's hosted service access
